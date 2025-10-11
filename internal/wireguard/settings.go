@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -24,6 +25,15 @@ type Settings struct {
 	PreSharedKey string
 	// Wireguard server endpoint to connect to.
 	Endpoint netip.AddrPort
+	// EndpointHostname is the server endpoint hostname for dynamic DNS scenarios.
+	// It is mutually exclusive with a static IP endpoint.
+	EndpointHostname string
+	// ResolveInterval is the interval for re-resolving the hostname.
+	// It defaults to DNS record TTL with a minimum of 60 seconds.
+	ResolveInterval time.Duration
+	// HealthCheckInterval is the interval for checking connection health.
+	// It defaults to 30 seconds.
+	HealthCheckInterval time.Duration
 	// Addresses assigned to the client.
 	// Note IPv6 addresses are ignored if IPv6 is not supported.
 	Addresses []netip.Prefix
@@ -61,6 +71,28 @@ func (s *Settings) SetDefaults() {
 		s.Endpoint = netip.AddrPortFrom(s.Endpoint.Addr(), defaultPort)
 	}
 
+	// Set default intervals for hostname-based endpoints
+	if s.EndpointHostname != "" {
+		// Set default resolve interval to DNS TTL with 60-second minimum
+		// The actual TTL-based resolution will be handled by the resolver
+		if s.ResolveInterval == 0 {
+			const defaultResolveInterval = 60 * time.Second // Minimum 60 seconds as per requirements
+			s.ResolveInterval = defaultResolveInterval
+		} else if s.ResolveInterval < 60*time.Second {
+			// Enforce minimum 60-second interval even for custom values
+			s.ResolveInterval = 60 * time.Second
+		}
+
+		// Set default health check interval to 30 seconds
+		if s.HealthCheckInterval == 0 {
+			const defaultHealthCheckInterval = 30 * time.Second // Default 30 seconds as per requirements
+			s.HealthCheckInterval = defaultHealthCheckInterval
+		} else if s.HealthCheckInterval < time.Second {
+			// Enforce minimum 1-second interval for health checks
+			s.HealthCheckInterval = time.Second
+		}
+	}
+
 	if s.FirewallMark == 0 {
 		const defaultFirewallMark = 51820
 		s.FirewallMark = defaultFirewallMark
@@ -89,26 +121,36 @@ func (s *Settings) SetDefaults() {
 }
 
 var (
-	ErrInterfaceNameInvalid    = errors.New("invalid interface name")
-	ErrPrivateKeyMissing       = errors.New("private key is missing")
-	ErrPrivateKeyInvalid       = errors.New("cannot parse private key")
-	ErrPublicKeyMissing        = errors.New("public key is missing")
-	ErrPublicKeyInvalid        = errors.New("cannot parse public key")
-	ErrPreSharedKeyInvalid     = errors.New("cannot parse pre-shared key")
-	ErrEndpointAddrMissing     = errors.New("endpoint address is missing")
-	ErrEndpointPortMissing     = errors.New("endpoint port is missing")
-	ErrAddressMissing          = errors.New("interface address is missing")
-	ErrAddressNotValid         = errors.New("interface address is not valid")
-	ErrAllowedIPsMissing       = errors.New("allowed IPs are missing")
-	ErrAllowedIPNotValid       = errors.New("allowed IP is not valid")
-	ErrAllowedIPv6NotSupported = errors.New("allowed IPv6 address not supported")
-	ErrKeepaliveIsNegative     = errors.New("keep alive interval is negative")
-	ErrFirewallMarkMissing     = errors.New("firewall mark is missing")
-	ErrMTUMissing              = errors.New("MTU is missing")
-	ErrImplementationInvalid   = errors.New("invalid implementation")
+	ErrInterfaceNameInvalid       = errors.New("invalid interface name")
+	ErrPrivateKeyMissing          = errors.New("private key is missing")
+	ErrPrivateKeyInvalid          = errors.New("cannot parse private key")
+	ErrPublicKeyMissing           = errors.New("public key is missing")
+	ErrPublicKeyInvalid           = errors.New("cannot parse public key")
+	ErrPreSharedKeyInvalid        = errors.New("cannot parse pre-shared key")
+	ErrEndpointAddrMissing        = errors.New("endpoint address is missing")
+	ErrEndpointPortMissing        = errors.New("endpoint port is missing")
+	ErrEndpointMutuallyExclusive  = errors.New("endpoint IP and hostname are mutually exclusive")
+	ErrEndpointRequired           = errors.New("either endpoint IP or hostname is required")
+	ErrEndpointHostnameInvalid    = errors.New("endpoint hostname is not valid")
+	ErrEndpointResolutionFailed   = errors.New("endpoint hostname resolution failed")
+	ErrAddressMissing             = errors.New("interface address is missing")
+	ErrAddressNotValid            = errors.New("interface address is not valid")
+	ErrAllowedIPsMissing          = errors.New("allowed IPs are missing")
+	ErrAllowedIPNotValid          = errors.New("allowed IP is not valid")
+	ErrAllowedIPv6NotSupported    = errors.New("allowed IPv6 address not supported")
+	ErrKeepaliveIsNegative        = errors.New("keep alive interval is negative")
+	ErrFirewallMarkMissing        = errors.New("firewall mark is missing")
+	ErrMTUMissing                 = errors.New("MTU is missing")
+	ErrImplementationInvalid      = errors.New("invalid implementation")
+	ErrResolveIntervalInvalid     = errors.New("resolve interval is invalid")
+	ErrHealthCheckIntervalInvalid = errors.New("health check interval is invalid")
 )
 
-var interfaceNameRegexp = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+var (
+	interfaceNameRegexp = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+	// hostnameRegex validates DNS hostname format according to RFC 1123
+	hostnameRegex = regexp.MustCompile(`^([a-zA-Z0-9]|[a-zA-Z0-9_][a-zA-Z0-9\-_]{0,61}[a-zA-Z0-9_])(\.([a-zA-Z0-9]|[a-zA-Z0-9_][a-zA-Z0-9\-_]{0,61}[a-zA-Z0-9]))*$`) //nolint:lll
+)
 
 func (s *Settings) Check() (err error) {
 	if !interfaceNameRegexp.MatchString(s.InterfaceName) {
@@ -133,11 +175,9 @@ func (s *Settings) Check() (err error) {
 		}
 	}
 
-	switch {
-	case !s.Endpoint.Addr().IsValid():
-		return fmt.Errorf("%w", ErrEndpointAddrMissing)
-	case s.Endpoint.Port() == 0:
-		return fmt.Errorf("%w", ErrEndpointPortMissing)
+	// Validate endpoint configuration (IP vs Hostname mutual exclusivity)
+	if err := s.validateEndpoint(); err != nil {
+		return err
 	}
 
 	if len(s.Addresses) == 0 {
@@ -301,4 +341,131 @@ func (s Settings) ToLines(settings ToLinesSettings) (lines []string) {
 	}
 
 	return lines
+}
+
+// validateEndpoint validates endpoint configuration ensuring mutual exclusivity
+// between IP and hostname, and validates hostname format when provided.
+func (s *Settings) validateEndpoint() error {
+	hasIP := s.Endpoint.Addr().IsValid() && !s.Endpoint.Addr().IsUnspecified()
+	hasHostname := s.EndpointHostname != ""
+
+	// Check mutual exclusivity
+	if hasIP && hasHostname {
+		return fmt.Errorf("%w", ErrEndpointMutuallyExclusive)
+	}
+
+	// At least one endpoint configuration is required
+	if !hasIP && !hasHostname {
+		return fmt.Errorf("%w", ErrEndpointRequired)
+	}
+
+	// Validate hostname format if provided
+	if hasHostname {
+		if !hostnameRegex.MatchString(s.EndpointHostname) {
+			return fmt.Errorf("%w: %s", ErrEndpointHostnameInvalid, s.EndpointHostname)
+		}
+
+		// Validate intervals for hostname-based endpoints
+		if s.ResolveInterval < 0 {
+			return fmt.Errorf("%w: resolve interval cannot be negative", ErrResolveIntervalInvalid)
+		}
+		if s.ResolveInterval > 0 && s.ResolveInterval < 60*time.Second {
+			return fmt.Errorf("%w: resolve interval must be at least 60 seconds", ErrResolveIntervalInvalid)
+		}
+		if s.HealthCheckInterval < 0 {
+			return fmt.Errorf("%w: health check interval cannot be negative", ErrHealthCheckIntervalInvalid)
+		}
+		if s.HealthCheckInterval > 0 && s.HealthCheckInterval < time.Second {
+			return fmt.Errorf("%w: health check interval must be at least 1 second", ErrHealthCheckIntervalInvalid)
+		}
+	}
+
+	// For IP-based endpoints, validate the existing endpoint requirements
+	if hasIP {
+		if s.Endpoint.Port() == 0 {
+			return fmt.Errorf("%w", ErrEndpointPortMissing)
+		}
+	}
+
+	return nil
+}
+
+// resolveHostnameEndpoint performs initial hostname resolution for hostname-based endpoints.
+// This method should be called during initialization to validate that the hostname can be resolved.
+func (s *Settings) resolveHostnameEndpoint(ctx context.Context) error {
+	if s.EndpointHostname == "" {
+		return nil // No hostname to resolve
+	}
+
+	// Create a temporary resolver for initial validation
+	resolverSettings := ResolverSettings{
+		Hostname:        s.EndpointHostname,
+		Port:            51820, // Default WireGuard port for validation
+		ResolveInterval: s.ResolveInterval,
+		UseTTL:          true,
+		MinInterval:     60 * time.Second,
+	}
+
+	// Use a no-op logger for validation
+	logger := &noOpLogger{}
+	resolver := NewEndpointResolver(resolverSettings, logger)
+
+	// Attempt initial resolution to validate the hostname
+	endpoint, err := resolver.ResolveInitial(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %s: %s", ErrEndpointResolutionFailed, s.EndpointHostname, err)
+	}
+
+	// Update the endpoint with the resolved IP for initial configuration
+	// The port will be set correctly later based on the actual configuration
+	s.Endpoint = endpoint
+
+	return nil
+}
+
+// noOpLogger is a minimal logger implementation for validation purposes
+type noOpLogger struct{}
+
+func (l *noOpLogger) Debug(msg string)                          {}
+func (l *noOpLogger) Debugf(format string, args ...interface{}) {}
+func (l *noOpLogger) Info(msg string)                           {}
+func (l *noOpLogger) Infof(format string, args ...interface{})  {}
+func (l *noOpLogger) Warn(msg string)                           {}
+func (l *noOpLogger) Warnf(format string, args ...interface{})  {}
+func (l *noOpLogger) Error(msg string)                          {}
+func (l *noOpLogger) Errorf(format string, args ...interface{}) {}
+
+// GetEffectiveResolveInterval returns the effective resolve interval,
+// taking into account DNS TTL with the 60-second minimum requirement.
+// This method can be used by the resolver to determine the actual interval to use.
+func (s *Settings) GetEffectiveResolveInterval(dnsTTL time.Duration) time.Duration {
+	if s.EndpointHostname == "" {
+		return 0 // Not applicable for IP-based endpoints
+	}
+
+	// If DNS TTL is available and valid, use it with minimum enforcement
+	if dnsTTL > 0 {
+		const minInterval = 60 * time.Second
+		if dnsTTL < minInterval {
+			return minInterval
+		}
+		return dnsTTL
+	}
+
+	// Fallback to configured interval
+	return s.ResolveInterval
+}
+
+// GetEffectiveHealthCheckInterval returns the effective health check interval.
+func (s *Settings) GetEffectiveHealthCheckInterval() time.Duration {
+	if s.EndpointHostname == "" {
+		return 0 // Not applicable for IP-based endpoints
+	}
+
+	return s.HealthCheckInterval
+}
+
+// IsHostnameBased returns true if this configuration uses hostname-based endpoints.
+func (s *Settings) IsHostnameBased() bool {
+	return s.EndpointHostname != ""
 }
