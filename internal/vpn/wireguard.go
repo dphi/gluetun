@@ -13,10 +13,11 @@ import (
 
 // setupWireguard sets Wireguard up using the configurators and settings given.
 // It returns a serverName for port forwarding (PIA) and an error if it fails.
+// The function now supports both standard IP-based and dynamic hostname-based WireGuard configurations.
 func setupWireguard(ctx context.Context, netlinker NetLinker,
 	fw Firewall, providerConf provider.Provider,
 	settings settings.VPN, ipv6Supported bool, logger wireguard.Logger) (
-	wireguarder *wireguard.Wireguard, serverName string, canPortForward bool, err error,
+	wireguarder wireguard.WireguardInterface, serverName string, canPortForward bool, err error,
 ) {
 	connection, err := providerConf.GetConnection(settings.Provider.ServerSelection, ipv6Supported)
 	if err != nil {
@@ -29,9 +30,10 @@ func setupWireguard(ctx context.Context, netlinker NetLinker,
 	logger.Debug("Wireguard client private key: " + gosettings.ObfuscateKey(wireguardSettings.PrivateKey))
 	logger.Debug("Wireguard pre-shared key: " + gosettings.ObfuscateKey(wireguardSettings.PreSharedKey))
 
-	wireguarder, err = wireguard.New(wireguardSettings, netlinker, logger)
+	// Use the new factory method that supports both standard and dynamic WireGuard
+	wireguarder, err = wireguard.NewWireguardManager(wireguardSettings, netlinker, logger)
 	if err != nil {
-		return nil, "", false, fmt.Errorf("creating Wireguard: %w", err)
+		return nil, "", false, fmt.Errorf("creating Wireguard manager: %w", err)
 	}
 
 	err = fw.SetVPNConnection(ctx, connection, settings.Wireguard.Interface)
