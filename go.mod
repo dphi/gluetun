@@ -8,6 +8,7 @@ require (
 	github.com/golang/mock v1.6.0
 	github.com/klauspost/compress v1.17.11
 	github.com/klauspost/pgzip v1.2.6
+	github.com/miekg/dns v1.1.62
 	github.com/pelletier/go-toml/v2 v2.2.3
 	github.com/qdm12/dns/v2 v2.0.0-rc8
 	github.com/qdm12/gosettings v0.4.4
@@ -40,7 +41,6 @@ require (
 	github.com/mdlayher/genetlink v1.3.2 // indirect
 	github.com/mdlayher/netlink v1.7.2 // indirect
 	github.com/mdlayher/socket v0.4.1 // indirect
-	github.com/miekg/dns v1.1.62 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_golang v1.20.5 // indirect
