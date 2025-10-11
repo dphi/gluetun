@@ -3,6 +3,8 @@ package settings
 import (
 	"fmt"
 	"net/netip"
+	"regexp"
+	"time"
 
 	"github.com/qdm12/gluetun/internal/constants/providers"
 	"github.com/qdm12/gosettings"
@@ -12,6 +14,9 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
+// hostnameRegex validates DNS hostname format according to RFC 1123
+var hostnameRegex = regexp.MustCompile(`^([a-zA-Z0-9]|[a-zA-Z0-9_][a-zA-Z0-9\-_]{0,61}[a-zA-Z0-9_])(\.([a-zA-Z0-9]|[a-zA-Z0-9_][a-zA-Z0-9\-_]{0,61}[a-zA-Z0-9]))*$`) //nolint:lll
+
 type WireguardSelection struct {
 	// EndpointIP is the server endpoint IP address.
 	// It is only used with VPN providers generating Wireguard
@@ -20,6 +25,11 @@ type WireguardSelection struct {
 	// to netip.IPv4Unspecified(). It can never be the zero value
 	// in the internal state.
 	EndpointIP netip.Addr `json:"endpoint_ip"`
+	// EndpointHostname is the server endpoint hostname.
+	// It is mutually exclusive with EndpointIP and is used for
+	// dynamic DNS scenarios where the IP address may change.
+	// It cannot be used together with EndpointIP.
+	EndpointHostname string `json:"endpoint_hostname"`
 	// EndpointPort is a the server port to use for the VPN server.
 	// It is optional for VPN providers IVPN, Mullvad, Surfshark
 	// and Windscribe, and compulsory for the others.
@@ -27,6 +37,13 @@ type WireguardSelection struct {
 	// a custom endpoint port. It cannot be nil in the internal
 	// state.
 	EndpointPort *uint16 `json:"endpoint_port"`
+	// ResolveInterval is the interval for re-resolving the hostname.
+	// It defaults to DNS record TTL with a minimum of 60 seconds.
+	// It cannot be nil in the internal state.
+	ResolveInterval *time.Duration `json:"resolve_interval"`
+	// HealthCheckInterval is the interval for checking connection health.
+	// It defaults to 30 seconds and cannot be nil in the internal state.
+	HealthCheckInterval *time.Duration `json:"health_check_interval"`
 	// PublicKey is the server public key.
 	// It is only used with VPN providers generating Wireguard
 	// configurations specific to each server and user.
@@ -36,17 +53,10 @@ type WireguardSelection struct {
 // Validate validates WireguardSelection settings.
 // It should only be ran if the VPN type chosen is Wireguard.
 func (w WireguardSelection) validate(vpnProvider string) (err error) {
-	// Validate EndpointIP
-	switch vpnProvider {
-	case providers.Airvpn, providers.Fastestvpn, providers.Ivpn,
-		providers.Mullvad, providers.Nordvpn, providers.Protonvpn,
-		providers.Surfshark, providers.Windscribe:
-		// endpoint IP addresses are baked in
-	case providers.Custom:
-		if !w.EndpointIP.IsValid() || w.EndpointIP.IsUnspecified() {
-			return fmt.Errorf("%w", ErrWireguardEndpointIPNotSet)
-		}
-	default: // Providers not supporting Wireguard
+	// Validate endpoint configuration (IP vs Hostname mutual exclusivity)
+	err = w.validateEndpoint(vpnProvider)
+	if err != nil {
+		return err
 	}
 
 	// Validate EndpointPort
@@ -111,23 +121,73 @@ func (w WireguardSelection) validate(vpnProvider string) (err error) {
 	return nil
 }
 
+// validateEndpoint validates endpoint configuration ensuring mutual exclusivity
+// between IP and hostname, and validates hostname format when provided.
+func (w WireguardSelection) validateEndpoint(vpnProvider string) (err error) {
+	hasIP := w.EndpointIP.IsValid() && !w.EndpointIP.IsUnspecified()
+	hasHostname := w.EndpointHostname != ""
+
+	// Check mutual exclusivity
+	if hasIP && hasHostname {
+		return fmt.Errorf("%w", ErrWireguardEndpointMutuallyExclusive)
+	}
+
+	switch vpnProvider {
+	case providers.Airvpn, providers.Fastestvpn, providers.Ivpn,
+		providers.Mullvad, providers.Nordvpn, providers.Protonvpn,
+		providers.Surfshark, providers.Windscribe:
+		// endpoint IP addresses are baked in for these providers
+		// hostname configuration is not supported
+		if hasHostname {
+			return fmt.Errorf("hostname endpoints are not supported for provider %s", vpnProvider)
+		}
+	case providers.Custom:
+		// For custom provider, exactly one of IP or hostname must be provided
+		if !hasIP && !hasHostname {
+			return fmt.Errorf("%w", ErrWireguardEndpointRequired)
+		}
+
+		// Validate hostname format if provided
+		if hasHostname {
+			if !hostnameRegex.MatchString(w.EndpointHostname) {
+				return fmt.Errorf("%w: %s", ErrWireguardEndpointHostnameNotValid, w.EndpointHostname)
+			}
+		}
+	default: // Providers not supporting Wireguard
+	}
+
+	return nil
+}
+
 func (w *WireguardSelection) copy() (copied WireguardSelection) {
 	return WireguardSelection{
-		EndpointIP:   w.EndpointIP,
-		EndpointPort: gosettings.CopyPointer(w.EndpointPort),
-		PublicKey:    w.PublicKey,
+		EndpointIP:          w.EndpointIP,
+		EndpointHostname:    w.EndpointHostname,
+		EndpointPort:        gosettings.CopyPointer(w.EndpointPort),
+		ResolveInterval:     gosettings.CopyPointer(w.ResolveInterval),
+		HealthCheckInterval: gosettings.CopyPointer(w.HealthCheckInterval),
+		PublicKey:           w.PublicKey,
 	}
 }
 
 func (w *WireguardSelection) overrideWith(other WireguardSelection) {
 	w.EndpointIP = gosettings.OverrideWithValidator(w.EndpointIP, other.EndpointIP)
+	w.EndpointHostname = gosettings.OverrideWithComparable(w.EndpointHostname, other.EndpointHostname)
 	w.EndpointPort = gosettings.OverrideWithPointer(w.EndpointPort, other.EndpointPort)
+	w.ResolveInterval = gosettings.OverrideWithPointer(w.ResolveInterval, other.ResolveInterval)
+	w.HealthCheckInterval = gosettings.OverrideWithPointer(w.HealthCheckInterval, other.HealthCheckInterval)
 	w.PublicKey = gosettings.OverrideWithComparable(w.PublicKey, other.PublicKey)
 }
 
 func (w *WireguardSelection) setDefaults() {
 	w.EndpointIP = gosettings.DefaultValidator(w.EndpointIP, netip.IPv4Unspecified())
 	w.EndpointPort = gosettings.DefaultPointer(w.EndpointPort, 0)
+
+	// Set default intervals
+	const defaultResolveInterval = 60 * time.Second     // Minimum 60 seconds
+	const defaultHealthCheckInterval = 30 * time.Second // Default 30 seconds
+	w.ResolveInterval = gosettings.DefaultPointer(w.ResolveInterval, defaultResolveInterval)
+	w.HealthCheckInterval = gosettings.DefaultPointer(w.HealthCheckInterval, defaultHealthCheckInterval)
 }
 
 func (w WireguardSelection) String() string {
@@ -141,8 +201,17 @@ func (w WireguardSelection) toLinesNode() (node *gotree.Node) {
 		node.Appendf("Endpoint IP address: %s", w.EndpointIP)
 	}
 
+	if w.EndpointHostname != "" {
+		node.Appendf("Endpoint hostname: %s", w.EndpointHostname)
+	}
+
 	if *w.EndpointPort != 0 {
 		node.Appendf("Endpoint port: %d", *w.EndpointPort)
+	}
+
+	if w.EndpointHostname != "" {
+		node.Appendf("Resolve interval: %s", *w.ResolveInterval)
+		node.Appendf("Health check interval: %s", *w.HealthCheckInterval)
 	}
 
 	if w.PublicKey != "" {
@@ -158,7 +227,19 @@ func (w *WireguardSelection) read(r *reader.Reader) (err error) {
 		return err
 	}
 
+	w.EndpointHostname = r.String("WIREGUARD_ENDPOINT_HOSTNAME", reader.ForceLowercase(false))
+
 	w.EndpointPort, err = r.Uint16Ptr("WIREGUARD_ENDPOINT_PORT", reader.RetroKeys("VPN_ENDPOINT_PORT"))
+	if err != nil {
+		return err
+	}
+
+	w.ResolveInterval, err = r.DurationPtr("WIREGUARD_ENDPOINT_RESOLVE_INTERVAL")
+	if err != nil {
+		return err
+	}
+
+	w.HealthCheckInterval, err = r.DurationPtr("WIREGUARD_ENDPOINT_HEALTH_CHECK_INTERVAL")
 	if err != nil {
 		return err
 	}
