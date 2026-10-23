@@ -13,3 +13,13 @@ updates:
     directory: /
     schedule:
       interval: "daily"
+
+  - package-ecosystem: docker
+    directories:
+    - /.devcontainer
+    schedule:
+      interval: weekly
+    groups:
+      docker-images:
+        patterns:
+        - '*'
