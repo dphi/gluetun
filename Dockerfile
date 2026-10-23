@@ -1,16 +1,16 @@
-ARG ALPINE_VERSION=3.20
+ARG ALPINE_VERSION=3.20.10
 ARG GO_ALPINE_VERSION=3.20
-ARG GO_VERSION=1.23
+ARG GO_VERSION=1.23.9
 ARG XCPUTRANSLATE_VERSION=v0.9.0
 ARG GOLANGCI_LINT_VERSION=v2.4.0
 ARG MOCKGEN_VERSION=v1.6.0
 ARG BUILDPLATFORM=linux/amd64
 
-FROM --platform=${BUILDPLATFORM} ghcr.io/qdm12/xcputranslate:${XCPUTRANSLATE_VERSION} AS xcputranslate
-FROM --platform=${BUILDPLATFORM} ghcr.io/qdm12/binpot:golangci-lint-${GOLANGCI_LINT_VERSION} AS golangci-lint
-FROM --platform=${BUILDPLATFORM} ghcr.io/qdm12/binpot:mockgen-${MOCKGEN_VERSION} AS mockgen
+FROM --platform=${BUILDPLATFORM} ghcr.io/qdm12/xcputranslate:${XCPUTRANSLATE_VERSION}@sha256:3232069f4d9f296460e6d20b1c16e21a0ec262aac7017e3f7d89b6416fa6fde8 AS xcputranslate
+FROM --platform=${BUILDPLATFORM} ghcr.io/qdm12/binpot:golangci-lint-${GOLANGCI_LINT_VERSION}@sha256:93544cd5ccaba7f8e6fa1b6bdb39e78a1c273888e1f16985595f2eb8a414e092 AS golangci-lint
+FROM --platform=${BUILDPLATFORM} ghcr.io/qdm12/binpot:mockgen-${MOCKGEN_VERSION}@sha256:2651dd4c78dd4cdc1093ae192aac7fd6a152dd1bfe687f4dcaf7face8ad9e9c7 AS mockgen
 
-FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION}-alpine${GO_ALPINE_VERSION} AS base
+FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION}-alpine${GO_ALPINE_VERSION}@sha256:96917b18cf0bf6dc54f726696eb526fe6e6a1ab45e43d4a292aae11f3d503ffe AS base
 COPY --from=xcputranslate /xcputranslate /usr/local/bin/xcputranslate
 # Note: findutils needed to have xargs support `-d` flag for mocks stage.
 RUN apk --update add git g++ findutils
@@ -59,7 +59,7 @@ RUN GOARCH="$(xcputranslate translate -field arch -targetplatform ${TARGETPLATFO
     -X 'main.commit=$COMMIT' \
     " -o entrypoint cmd/gluetun/main.go
 
-FROM alpine:${ALPINE_VERSION}
+FROM alpine:${ALPINE_VERSION}@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 ARG VERSION=unknown
 ARG CREATED="an unknown date"
 ARG COMMIT=unknown
